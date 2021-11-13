@@ -1,9 +1,9 @@
 use std::net::SocketAddr;
 
-mod client;
+pub mod client;
 mod config;
 mod error;
-mod server;
+pub mod server;
 use config::Config;
 use error::Error;
 
