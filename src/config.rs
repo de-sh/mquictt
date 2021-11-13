@@ -1,5 +1,7 @@
 pub struct Config {
-    pub auth: Auth
+    pub auth: Auth,
+    pub addr: String,
+    pub port: String,
 }
 
 pub struct Auth {
