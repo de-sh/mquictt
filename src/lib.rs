@@ -1,9 +1,9 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-mod client;
+pub mod client;
 mod config;
 mod error;
-mod server;
+pub mod server;
 use config::Config;
 use error::Error;
 
@@ -72,7 +72,7 @@ impl Connection {
         })
     }
 
-    pub fn create_stream() -> Result<u64, Error> {
+    pub fn create_stream(&mut self) -> Result<u64, Error> {
         unimplemented!()
     }
 

@@ -7,6 +7,8 @@ edition = "2021"
 bytes = "1"
 log = "0.4"
 mio = { version = "0.7", features = ["os-poll", "net"] }
+mqttbytes = "0.6"
 quiche = { version = "0.10" }
 ring = "0.16"
 thiserror = "1.0"
+tokio = { version = "1.13", features = ["sync", "rt"] }
