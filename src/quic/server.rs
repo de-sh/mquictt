@@ -2,19 +2,30 @@ use std::collections::HashMap;
 use std::net;
 use std::sync::Arc;
 
+use super::MAX_DATAGRAM_SIZE;
 use crate::config::Config;
 use crate::error::Error;
-use crate::Connection;
 
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use mio::Interest;
+use ring::rand::*;
 
-pub struct Server {
-    cfg: Arc<Config>,
-    clients: HashMap<quiche::ConnectionId<'static>, Connection>,
+struct PartialResponse {
+    body: Vec<u8>,
+    written: usize,
 }
 
-impl Server {
+struct Client {
+    conn: std::pin::Pin<Box<quiche::Connection>>,
+    partial_responses: HashMap<u64, PartialResponse>,
+}
+
+pub struct QuicServer {
+    cfg: Arc<Config>,
+    clients: HashMap<quiche::ConnectionId<'static>, Client>,
+}
+
+impl QuicServer {
     pub fn new(cfg: Arc<Config>) -> Self {
         Self {
             cfg,
@@ -22,9 +33,9 @@ impl Server {
         }
     }
 
-    pub async fn eventloop(&mut self) -> Result<(), Error> {
+    pub async fn accept_clients(&mut self) -> Result<(), Error> {
         let mut buf = [0; 65535];
-        let mut out = [0; crate::MAX_DATAGRAM_SIZE];
+        let mut out = [0; MAX_DATAGRAM_SIZE];
 
         // Setup event loop.
         let mut poll = mio::Poll::new()?;
@@ -40,12 +51,12 @@ impl Server {
             Interest::READABLE | Interest::READABLE,
         )?;
 
-        let rng = ring::rand::SystemRandom::new();
+        let rng = SystemRandom::new();
         let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng)
             .map_err(|_| Error::RingUnspecified)?;
 
         loop {
-            let timeout = self.clients.values().filter_map(|c| c.timeout()).min();
+            let timeout = self.clients.values().filter_map(|c| c.conn.timeout()).min();
             poll.poll(&mut events, timeout)?;
 
             // Read incoming UDP packets from the socket and try initiating a connection,
@@ -54,7 +65,7 @@ impl Server {
                 // If event loop reports no events, the timeout must have expired,
                 // handle it without attempting to read packets, then proceed with send loop.
                 if events.is_empty() {
-                    self.clients.values_mut().for_each(|c| c.on_timeout());
+                    self.clients.values_mut().for_each(|c| c.conn.on_timeout());
                     break 'read;
                 }
 
@@ -152,7 +163,7 @@ impl Server {
                         continue 'read;
                     }
 
-                    let odcid = validate_token(&from, &token);
+                    let odcid = validate_token(&from, token);
 
                     // The token was not valid, meaning the retry failed, so
                     // drop the packet.
@@ -171,9 +182,15 @@ impl Server {
                     let scid = hdr.dcid.clone();
 
                     debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
-
-                    let client =
-                        Connection::accept(&scid, odcid.as_ref(), from, self.cfg.clone()).await?;
+                    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+                    // Configure connection
+                    config.load_verify_locations_from_file(&self.cfg.auth.ca_cert_file)?;
+                    config.load_cert_chain_from_pem_file(&self.cfg.auth.cert_file)?;
+                    config.load_priv_key_from_pem_file(&self.cfg.auth.key_file)?;
+                    let client = Client {
+                        conn: quiche::accept(&scid, None, from, &mut config)?,
+                        partial_responses: HashMap::new(),
+                    };
 
                     self.clients.insert(scid.clone(), client);
 
@@ -184,7 +201,96 @@ impl Server {
                         None => self.clients.get_mut(&conn_id).ok_or(Error::MissingClient)?,
                     }
                 };
+
+                let recv_info = quiche::RecvInfo { from };
+
+                // Process potentially coalesced packets.
+                let read = match client.conn.recv(pkt_buf, recv_info) {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        error!("{} recv failed: {:?}", client.conn.trace_id(), e);
+                        continue 'read;
+                    }
+                };
+
+                debug!("{} processed {} bytes", client.conn.trace_id(), read);
+
+                if client.conn.is_in_early_data() || client.conn.is_established() {
+                    // Handle writable streams.
+                    for stream_id in client.conn.writable() {
+                        handle_writable(client, stream_id);
+                    }
+
+                    // Process all readable streams.
+                    for s in client.conn.readable() {
+                        while let Ok((read, fin)) = client.conn.stream_recv(s, &mut buf) {
+                            debug!("{} received {} bytes", client.conn.trace_id(), read);
+
+                            let stream_buf = &buf[..read];
+
+                            debug!(
+                                "{} stream {} has {} bytes (fin? {})",
+                                client.conn.trace_id(),
+                                s,
+                                stream_buf.len(),
+                                fin
+                            );
+
+                            handle_stream(client, s, stream_buf, "examples/root");
+                        }
+                    }
+                }
             }
+
+            // Generate outgoing QUIC packets for all active connections and send
+            // them on the UDP socket, until quiche reports that there are no more
+            // packets to be sent.
+            for client in self.clients.values_mut() {
+                loop {
+                    let (write, send_info) = match client.conn.send(&mut out) {
+                        Ok(v) => v,
+
+                        Err(quiche::Error::Done) => {
+                            debug!("{} done writing", client.conn.trace_id());
+                            break;
+                        }
+
+                        Err(e) => {
+                            error!("{} send failed: {:?}", client.conn.trace_id(), e);
+
+                            client.conn.close(false, 0x1, b"fail").ok();
+                            break;
+                        }
+                    };
+
+                    if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            debug!("send() would block");
+                            break;
+                        }
+
+                        panic!("send() failed: {:?}", e);
+                    }
+
+                    debug!("{} written {} bytes", client.conn.trace_id(), write);
+                }
+            }
+
+            // Garbage collect closed connections.
+            self.clients.retain(|_, ref mut c| {
+                debug!("Collecting garbage");
+
+                if c.conn.is_closed() {
+                    info!(
+                        "{} connection collected {:?}",
+                        c.conn.trace_id(),
+                        c.conn.stats()
+                    );
+                }
+
+                !c.conn.is_closed()
+            });
         }
     }
 }
@@ -241,4 +347,88 @@ fn validate_token<'a>(src: &net::SocketAddr, token: &'a [u8]) -> Option<quiche::
     }
 
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
+}
+
+/// Handles incoming HTTP/0.9 requests.
+fn handle_stream(client: &mut Client, stream_id: u64, buf: &[u8], root: &str) {
+    let conn = &mut client.conn;
+
+    if buf.len() > 4 && &buf[..4] == b"GET " {
+        let uri = &buf[4..buf.len()];
+        let uri = String::from_utf8(uri.to_vec()).unwrap();
+        let uri = String::from(uri.lines().next().unwrap());
+        let uri = std::path::Path::new(&uri);
+        let mut path = std::path::PathBuf::from(root);
+
+        for c in uri.components() {
+            if let std::path::Component::Normal(v) = c {
+                path.push(v)
+            }
+        }
+
+        info!(
+            "{} got GET request for {:?} on stream {}",
+            conn.trace_id(),
+            path,
+            stream_id
+        );
+
+        let body = std::fs::read(path.as_path()).unwrap_or_else(|_| b"Not Found!\r\n".to_vec());
+
+        info!(
+            "{} sending response of size {} on stream {}",
+            conn.trace_id(),
+            body.len(),
+            stream_id
+        );
+
+        let written = match conn.stream_send(stream_id, &body, true) {
+            Ok(v) => v,
+
+            Err(quiche::Error::Done) => 0,
+
+            Err(e) => {
+                error!("{} stream send failed {:?}", conn.trace_id(), e);
+                return;
+            }
+        };
+
+        if written < body.len() {
+            let response = PartialResponse { body, written };
+            client.partial_responses.insert(stream_id, response);
+        }
+    }
+}
+
+/// Handles newly writable streams.
+fn handle_writable(client: &mut Client, stream_id: u64) {
+    let conn = &mut client.conn;
+
+    debug!("{} stream {} is writable", conn.trace_id(), stream_id);
+
+    if !client.partial_responses.contains_key(&stream_id) {
+        return;
+    }
+
+    let resp = client.partial_responses.get_mut(&stream_id).unwrap();
+    let body = &resp.body[resp.written..];
+
+    let written = match conn.stream_send(stream_id, body, true) {
+        Ok(v) => v,
+
+        Err(quiche::Error::Done) => 0,
+
+        Err(e) => {
+            client.partial_responses.remove(&stream_id);
+
+            error!("{} stream send failed {:?}", conn.trace_id(), e);
+            return;
+        }
+    };
+
+    resp.written += written;
+
+    if resp.written == resp.body.len() {
+        client.partial_responses.remove(&stream_id);
+    }
 }
