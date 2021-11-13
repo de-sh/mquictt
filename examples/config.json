@@ -1,0 +1,7 @@
+{
+    "auth": {
+        "ca_cert_file": "",
+        "cert_file": "",
+        "key_file": ""
+    }
+}

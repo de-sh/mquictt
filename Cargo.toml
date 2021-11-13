@@ -1,0 +1,8 @@
+[package]
+name = "mquictt"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+quiche = { version = "0.10" }
+thiserror = "1.0"
