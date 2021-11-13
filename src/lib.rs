@@ -43,7 +43,11 @@ impl Connection {
         })
     }
 
-    pub fn accept(cfg: Config, from: SocketAddr) -> Result<Self, Error> {
+    pub fn accept(cfg: Config) -> Result<Self, Error> {
+        unimplemented!()
+    }
+
+    pub fn create_stream() -> Result<u64, Error> {
         unimplemented!()
     }
 
