@@ -4,5 +4,9 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
+bytes = "1"
+log = "0.4"
+mio = { version = "0.7", features = ["os-poll", "net"] }
 quiche = { version = "0.10" }
+ring = "0.16"
 thiserror = "1.0"
