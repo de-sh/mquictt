@@ -47,7 +47,7 @@ impl Connection {
         unimplemented!()
     }
 
-    pub fn create_stream() -> Result<u64, Error> {
+    pub fn create_stream(&mut self) -> Result<u64, Error> {
         unimplemented!()
     }
 

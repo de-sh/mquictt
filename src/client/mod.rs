@@ -1,3 +1,4 @@
+#![allow(unreachable_code)]
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -5,7 +6,10 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use mqttbytes::{QoS, v4::{self, Packet, Publish, Subscribe, Unsubscribe}};
+use mqttbytes::{
+    v4::{self, Connect, Packet, Publish, Subscribe, Unsubscribe},
+    QoS,
+};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{config::Config, error::Error, Connection};
@@ -125,9 +129,35 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn new(server_addr: SocketAddr, config: Config) -> Result<Self, Error> {
-        let conn = Connection::connect(config, server_addr)?;
-        unimplemented!("send connect and read connack");
+    pub async fn new(
+        server_addr: SocketAddr,
+        config: Config,
+        id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let mut conn = Connection::connect(config, server_addr)?;
+        let mut buf = BytesMut::new();
+
+        // sending connect
+        if let Err(e) = Connect::new(id).write(&mut buf) {
+            return Err(Error::MQTT(e));
+        }
+        let stream_id = conn.create_stream()?;
+        conn.recv_from_stream(stream_id, &mut buf)?;
+
+        // wait for connack
+        loop {
+            match v4::read(&mut buf, 1024 * 1024) {
+                Ok(Packet::ConnAck(_)) => break,
+                Ok(_) => continue,
+                Err(mqttbytes::Error::InsufficientBytes(_)) => {
+                    conn.recv_from_stream(stream_id, &mut buf)?;
+                    continue;
+                }
+
+                Err(e) => return Err(Error::MQTT(e)),
+            };
+        }
+
         Ok(Client {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -135,15 +165,16 @@ impl Client {
 
     pub async fn subscribe(&self, topic: impl Into<String>) -> Result<Subscriber, Error> {
         let mut conn = self.conn.lock().unwrap();
+        let topic = topic.into();
         let mut buf = BytesMut::new();
-        if let Err(e) = Subscribe::new(topic, QoS::AtMostOnce).write(&mut buf) {
+        if let Err(e) = Subscribe::new(&topic, QoS::AtMostOnce).write(&mut buf) {
             return Err(Error::MQTT(e));
         };
         let stream_id = conn.create_stream()?;
         conn.send_to_stream(stream_id, buf.freeze())?;
         Ok(Subscriber {
             conn: self.conn.clone(),
-            topic: topic.into(),
+            topic,
             stream_id,
             buf: BytesMut::new(),
         })
