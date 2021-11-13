@@ -1,12 +1,14 @@
-use std::{net::SocketAddr};
+use std::net::SocketAddr;
 
+mod client;
 mod config;
 mod error;
+mod server;
 use config::Config;
 use error::Error;
 
-use quiche::ConnectionId;
 use bytes::{Bytes, BytesMut};
+use quiche::ConnectionId;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -45,11 +47,11 @@ impl Connection {
         unimplemented!()
     }
 
-    pub fn send_to_topic(&mut self, topic: String, bytes: Bytes) -> Result<(), Error> {
+    pub fn send_to_stream(&mut self, stream_id: u64, bytes: Bytes) -> Result<(), Error> {
         unimplemented!()
     }
 
-    pub fn recv_from_topic(&mut self, topic: String, bytes: &mut BytesMut) -> Result<(), Error> {
+    pub fn recv_from_stream(&mut self, stream_id: u64, bytes: &mut BytesMut) -> Result<(), Error> {
         unimplemented!()
     }
 }
